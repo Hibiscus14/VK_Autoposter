@@ -1,6 +1,4 @@
-﻿using System.Security.Cryptography;
-
-namespace VK_Autoposter
+﻿namespace VK_Autoposter
 {
     internal static class Utils
     {
@@ -12,24 +10,25 @@ namespace VK_Autoposter
 
             var imagesCount = Config.DaysCount;
             if (imagesCount == 0 || imagesCount > images.Count) imagesCount = images.Count;
+            if (imagesCount > 300) imagesCount = 300;
 
+            int publishTimeIndex = 0; 
             for (int i = 0; i < imagesCount; i++)
             {
-                for (int j = 0; j < imagesPerDay; j++)
-                {
-                    foreach (var publishTime in publishTimes)
-                    {
+                DateTime publishDate = GetNextPublishDate(ref startDate, daysOfWeek, publishTimes[publishTimeIndex]);
 
-                        DateTime publishDate = GetNextPublishDate(ref startDate, daysOfWeek, publishTime);
-                        if (!schedule.ContainsKey(images[i]) && !schedule.ContainsValue(publishDate))
-                            schedule.Add(images[i], publishDate);
-                    }
+                if (!schedule.ContainsValue(publishDate))
+                {
+                    schedule.Add(images[i], publishDate);
+
+                    publishTimeIndex = (publishTimeIndex + 1) % publishTimes.Count;
                 }
-                startDate = startDate.AddDays(1);
+
+                if ((i + 1) % imagesPerDay == 0)
+                    startDate = startDate.AddDays(1);
             }
 
             return schedule;
-
         }
 
         private static DateTime GetNextPublishDate(ref DateTime startDate, List<DayOfWeek> daysOfWeek, TimeSpan publishTime)
@@ -42,44 +41,30 @@ namespace VK_Autoposter
             return startDate.Date.Add(publishTime);
         }
 
-        public static void LogError(string image, DateTime date, Exception ex)
+        public static async Task LogErrorAsync(string image, DateTime date, Exception ex)
         {
             string logFilePath = "error_log.txt";
-
             using (StreamWriter writer = new StreamWriter(logFilePath, true))
             {
-                writer.WriteLine($"{DateTime.Now}: Ошибка при публикации поста {image} на дату {date}: {ex.Message}\n");
-                writer.WriteLine(ex.StackTrace);
+                await writer.WriteLineAsync($"{DateTime.Now}: Ошибка при публикации поста {image} на дату {date}: {ex.Message}\n");
+                await writer.WriteLineAsync(ex.StackTrace);
             }
         }
-        public static void MoveImage(string imagePath, string time)
+
+        public static async Task MoveImageAsync(string imagePath, string time)
         {
+            string resultsDirectory = Path.Combine(Config.ImageFolderPath, "results");
+            if (!Directory.Exists(resultsDirectory))
+                Directory.CreateDirectory(resultsDirectory);
 
-            if (!Directory.Exists(Directory.GetCurrentDirectory() + "//results"))
-                Directory.CreateDirectory(Directory.GetCurrentDirectory() + "//results");
+            string timeDirectory = Path.Combine(resultsDirectory, time);
+            if (!Directory.Exists(timeDirectory))
+                Directory.CreateDirectory(timeDirectory);
 
-            if (!Directory.Exists(Directory.GetCurrentDirectory() + $"//results//{time}"))
-                Directory.CreateDirectory(Directory.GetCurrentDirectory() + $"//results//{time}");
+            string destinationPath = Path.Combine(timeDirectory, Path.GetFileName(imagePath));
 
-            string destinationPath = Path.Combine(Directory.GetCurrentDirectory() + $"//results//{time}", Path.GetFileName(imagePath));
-
-            File.Move(imagePath, destinationPath);
+            await Task.Run(() => File.Move(imagePath, destinationPath));
         }
-        public static void Shuffle<T>(this IList<T> list)
-        {
-            RNGCryptoServiceProvider provider = new RNGCryptoServiceProvider();
-            int n = list.Count;
-            while (n > 1)
-            {
-                byte[] box = new byte[1];
-                do provider.GetBytes(box);
-                while (!(box[0] < n * (Byte.MaxValue / n)));
-                int k = (box[0] % n);
-                n--;
-                T value = list[k];
-                list[k] = list[n];
-                list[n] = value;
-            }
-        }
+
     }
 }

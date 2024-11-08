@@ -1,14 +1,18 @@
-﻿using System.Net;
+﻿using System.Collections.Concurrent;
+using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using VkNet;
 using VkNet.Model;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace VK_Autoposter
 {
     internal static class Autoposter
     {
         private static VkApi vk;
-
+        private static readonly SemaphoreSlim apiRateLimitSemaphore = new SemaphoreSlim(1, 1);
+        private static readonly TimeSpan apiDelay = TimeSpan.FromMilliseconds(333); // Задержка между вызовами API для ограничения до 3 раз в секунду
 
         static async Task Main(string[] args)
         {
@@ -22,11 +26,11 @@ namespace VK_Autoposter
                 {
                     case ConsoleKey.D1:
                         Config.Create();
-                        ReadData();
+                        await ReadDataAsync();
                         break;
                     case ConsoleKey.D2:
                         Config.Choose();
-                        ReadData();
+                        await ReadDataAsync();
                         break;
                     case ConsoleKey.D3:
                         Config.Choose();
@@ -39,20 +43,16 @@ namespace VK_Autoposter
                     default:
                         Console.WriteLine("\nНекорректное значение");
                         return;
-
                 }
             }
             Console.ReadKey();
         }
 
-
-
-        private static void ReadData()
+        private static async Task ReadDataAsync()
         {
             try
             {
                 Config.Read();
-
                 if (Config.AccessToken == null)
                 {
                     Config.WriteAccessToken();
@@ -62,86 +62,106 @@ namespace VK_Autoposter
             catch (Exception ex)
             {
                 Console.WriteLine($"\nОшибка входных данных: {ex}");
-
             }
-            StartPosting();
+
+            await StartPostingAsync();
         }
 
-        private static void StartPosting()
+        private static async Task StartPostingAsync()
         {
             var attemptTime = DateTime.Now.ToShortDateString();
+            var images = Directory.GetFiles(Config.ImageFolderPath, "*.jpg")
+                                  .Concat(Directory.GetFiles(Config.ImageFolderPath, "*.png")).ToList();
 
-            var images = Directory.GetFiles(Config.ImageFolderPath, "*.jpg").Concat(Directory.GetFiles(Config.ImageFolderPath, "*.png")).ToList();
             if (images.Count == 0)
             {
                 Console.WriteLine("\nВ папке нет изображений.");
                 return;
             }
 
-            if (Config.Shuffle) images.Shuffle();
+            if (Config.Shuffle) Random.Shared.Shuffle(CollectionsMarshal.AsSpan(images));
 
             var publishSchedule = Utils.GeneratePublishSchedule(images, Config.DaysOfWeek, Config.PostsPerDay, Config.PostTimes);
-
             Console.WriteLine();
+
             int success = 0;
-            Dictionary<string, DateTime> unsuccessfullyPublished = new Dictionary<string, DateTime>();
-            foreach (var post in publishSchedule)
+            var postsToPublish = new ConcurrentDictionary<string, DateTime>();
+
+            await PublishPostsAsync(publishSchedule, attemptTime, postsToPublish);
+
+            while (postsToPublish.Count > 0)
+            {
+                Console.WriteLine($"\nКоличество постов с ошибками: {postsToPublish.Count}. Попробовать снова? (y/n)");
+
+                var answer = Console.ReadKey().Key;
+                if (answer == ConsoleKey.Y)
+                {
+                    Console.WriteLine("\nПовторная попытка публикации...");
+                    var retryPosts = new Dictionary<string, DateTime>(postsToPublish);
+                    postsToPublish.Clear();
+                    await PublishPostsAsync(retryPosts, attemptTime, postsToPublish);
+                }
+                else
+                {
+                    Console.WriteLine("\nЗавершение работы программы.");
+                    return;
+                }
+            }
+
+            Console.WriteLine($"\nВсе посты успешно опубликованы!");
+        }
+
+        private static async Task PublishPostsAsync(Dictionary<string, DateTime> postsToPublish, string attemptTime, ConcurrentDictionary<string, DateTime> unsuccessfullyPublished)
+        {
+            var tasks = postsToPublish.Select(async post =>
             {
                 try
                 {
-                    PostImageToWall(post);
-                    success++;
-                    Utils.MoveImage(post.Key, attemptTime);
+                    await PostImageToWallAsync(post);
+                    await Utils.MoveImageAsync(post.Key, attemptTime);
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"\nОшибка при публикации поста {post.Key} на дату {post.Value}: {ex}");
-                    Utils.LogError(post.Key, post.Value, ex);
-                    unsuccessfullyPublished.Add(post.Key, post.Value);
-
-
+                    await Utils.LogErrorAsync(post.Key, post.Value, ex);
+                    unsuccessfullyPublished.TryAdd(post.Key, post.Value);
                 }
-
-            }
-            Console.WriteLine($"\nУспешно опубликовано {success} постов!");
-
-            if (unsuccessfullyPublished.Count > 0)
-            {
-                Console.WriteLine($"\nОпубликовано с ошибкой {unsuccessfullyPublished.Count} постов.\nПопробовать снова?(y/n)");
-                var answer = Console.ReadKey();
-                if (answer.Key == ConsoleKey.Y)
-                {
-                    foreach (var post in unsuccessfullyPublished)
-                        PostImageToWall(post);
-                }
-
-            }
-
-        }
-
-
-
-        private static void PostImageToWall(KeyValuePair<string, DateTime> post)
-        {
-            var uploadServer = vk.Photo.GetWallUploadServer(Config.GroupId);
-            var uploader = new WebClient();
-            var responseFile = Encoding.ASCII.GetString(uploader.UploadFile(uploadServer.UploadUrl, post.Key));
-
-            var photos = vk.Photo.SaveWallPhoto(responseFile, null, (ulong)Config.GroupId);
-
-            vk.Wall.Post(new WallPostParams
-            {
-                OwnerId = -Config.GroupId,
-                Attachments = photos,
-                FromGroup = true,
-                Signed = false,
-                PublishDate = post.Value
             });
 
-            Console.WriteLine($"Запланирован пост: {post.Key} на {post.Value}");
+            await Task.WhenAll(tasks);
         }
 
+        private static async Task PostImageToWallAsync(KeyValuePair<string, DateTime> post)
+        {
+            // Ограничение частоты вызовов VkApi
+            await apiRateLimitSemaphore.WaitAsync();
+            try
+            {
+                var uploadServer = await vk.Photo.GetWallUploadServerAsync(Config.GroupId);
+                await Task.Delay(apiDelay); // Задержка между запросами API
+
+                var uploader = new WebClient();
+                var responseFile = Encoding.ASCII.GetString(await uploader.UploadFileTaskAsync(uploadServer.UploadUrl, post.Key));
+                await Task.Delay(apiDelay); // Задержка между запросами API
+
+                var photos = await vk.Photo.SaveWallPhotoAsync(responseFile, null, (ulong)Config.GroupId);
+                await Task.Delay(apiDelay); // Задержка между запросами API
+
+                await vk.Wall.PostAsync(new WallPostParams
+                {
+                    OwnerId = -Config.GroupId,
+                    Attachments = photos,
+                    FromGroup = true,
+                    Signed = false,
+                    PublishDate = post.Value
+                });
+
+                Console.WriteLine($"Запланирован пост: {post.Key} на {post.Value}");
+            }
+            finally
+            {
+                apiRateLimitSemaphore.Release();
+            }
+        }
     }
-
-
 }
